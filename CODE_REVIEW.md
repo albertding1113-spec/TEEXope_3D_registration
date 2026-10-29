@@ -1,5 +1,12 @@
 # Registration and export audit
 
+The current rigid format uses adjacent-layer offsets (`adjacent_layer_v1`).
+Saved `dx_raw`, `dy_raw`, `dz_raw` rows are accumulated only when constructing
+working coordinates. Editing one pair propagates through all later layers;
+automatic XY/Z limits apply per pair. Only the current adjacent-layer checkpoint
+format is supported.
+The historical audit below describes the earlier absolute-offset format where noted.
+
 The revised pipeline passes thirteen synthetic integration tests, including saved overlap previews, independent workflow stages, manual rigid corrections, TIFF-based illumination standardization, sparse-signal ROI discovery, and skipped rigid pairs. The supplied workspace contains code only; the acquisition path is a Linux cluster path unavailable here. Successful registration of every real layer and PB-scale runtime therefore remain unverified.
 
 ## Coordinate interpretation

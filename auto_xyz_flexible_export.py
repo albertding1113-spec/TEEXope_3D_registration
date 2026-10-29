@@ -8,6 +8,8 @@ imagecodecs (for LZW output). Input TIFF axes Z,Y,X; stage/config XYZ.
 The 3D rigid step translates XYZ but DOES NOT deform Z nonrigidly.
 The flexible step estimates XY sample offsets varying by XY, not by depth.
 Both stages checkpoint each Z layer; exports reuse their registration directory.
+Rigid checkpoints and editable CSV rows store adjacent-layer XYZ corrections.
+All geometry stages accumulate those corrections internally; automatic limits are per pair.
 """
 from __future__ import annotations
 
@@ -31,6 +33,35 @@ from scipy.ndimage import gaussian_filter, map_coordinates
 from scipy.spatial import cKDTree
 
 NAME_RE = re.compile(r"^X([-+]?\d+(?:\.\d+)?)_Y([-+]?\d+(?:\.\d+)?)_Z([-+]?\d+(?:\.\d+)?)$")
+RIGID_OFFSET_CONVENTION = 'adjacent_layer_v1'
+
+
+def accumulate_rigid_offsets(relative: np.ndarray) -> np.ndarray:
+    """Convert saved adjacent-layer corrections into internal absolute corrections."""
+    relative = np.asarray(relative, dtype=np.float64)
+    if relative.ndim != 2 or relative.shape[1] != 3 or not len(relative) or not np.all(np.isfinite(relative)):
+        raise ValueError('Rigid offsets must be a finite nonempty [layers,3] XYZ array')
+    if np.any(relative[0] != 0):
+        raise ValueError('Rigid reference layer 0 must retain XYZ correction [0,0,0]')
+    with np.errstate(over='ignore', invalid='ignore'):
+        absolute = np.cumsum(relative, axis=0)
+    if not np.all(np.isfinite(absolute)):
+        raise ValueError('Accumulated rigid offsets must be finite')
+    return absolute
+
+
+def relative_rigid_offsets(absolute: np.ndarray) -> np.ndarray:
+    """Difference absolute corrections; row i corrects layer i relative to i-1."""
+    absolute = np.asarray(absolute, dtype=np.float64)
+    if absolute.ndim != 2 or absolute.shape[1] != 3 or not len(absolute) or not np.all(np.isfinite(absolute)):
+        raise ValueError('Rigid offsets must be a finite nonempty [layers,3] XYZ array')
+    if np.any(absolute[0] != 0):
+        raise ValueError('Rigid reference layer 0 must retain XYZ correction [0,0,0]')
+    with np.errstate(over='ignore', invalid='ignore'):
+        relative = np.diff(absolute, axis=0, prepend=np.zeros((1, 3)))
+    if not np.all(np.isfinite(relative)):
+        raise ValueError('Pairwise rigid offsets must be finite')
+    return relative
 
 
 def progress(message: str, *args) -> None:
@@ -52,6 +83,7 @@ class Config:
     stack_shape: tuple[int, int, int] = (2048, 2048, 640)  # XYZ, raw pixels
     voxel_size: tuple[float, float, float] = (0.1489, 0.1489, 0.5)  # XYZ, um
     flip_stage_xy: bool = True  # preserve original position conversion
+    layer_z_tolerance_um: float = 1.0  # group Z spans strictly below this; 0 keeps legacy voxel grouping
     registration_dir: Optional[str] = None  # independent of export_path; default: dir_path/_registration_xyz_flexible
     registration_only: bool = False  # compute/cache alignment without exporting TIFF images
     workflow_stage: str = "all"  # all, rigid, flexible, export, preview
@@ -64,9 +96,9 @@ class Config:
     rigid_roi_count: int = 3  # maximum signal-ranked 3D matching regions
     rigid_signal_candidates: int = 64  # bounded scouting budget, not full 3D volumes
     rigid_signal_z_samples: int = 5  # planes per candidate per layer
-    rigid_skip_on_failure: bool = True  # retain nominal position if no reliable rigid match
-    rigid_max_xy_shift_px: float = 512.0  # maximum rigid correction from nominal stage positions
-    rigid_max_z_shift_px: float = 256.0
+    rigid_skip_on_failure: bool = True  # save zero pair shift and inherit preceding correction on failure
+    rigid_max_xy_shift_px: float = 512.0  # maximum additional X/Y correction per adjacent layer
+    rigid_max_z_shift_px: float = 256.0  # maximum additional Z correction per adjacent layer
     rigid_min_ncc: float = 0.10  # normalized cross correlation of valid 3D voxels
     rigid_min_overlap: float = 0.12  # required valid common fraction after shifting
     rigid_max_volume_megavoxels: float = 8.0  # per 3D ROI thumbnail
@@ -81,7 +113,7 @@ class Config:
     xy_blend_overlap_ratio: float = 0.05
     if_z_blend: bool = True
     if_standardization: bool = False
-    stand_img_path: Optional[str] = None  # single YX TIFF illumination profile, shared by signal channels
+    stand_img_path: Optional[str] = None  # native YX illumination profile for registration and signal export
     segmented_ch: tuple[str, ...] = ()
     segmentation_mode: str = "binary_255"  # or 'preserve_labels'; NN, never averaging
 
@@ -130,7 +162,8 @@ class Index:
 class PageCache:
     """Bounded LRU of *post-XY-downsampling* single 2D TIFF pages."""
     def __init__(self, capacity_mb: int, max_open_files: int = 64,
-                 strict: bool = True, expected_shape: Optional[tuple] = None):
+                 strict: bool = True, expected_shape: Optional[tuple] = None,
+                 standard_factor: Optional[np.ndarray] = None):
         self.limit = int(capacity_mb * 1024 * 1024)
         self.cache = OrderedDict()
         self.nbytes = 0
@@ -138,6 +171,7 @@ class PageCache:
         self.max_open_files = max(1, max_open_files)
         self.strict = strict
         self.expected_shape = expected_shape
+        self.standard_factor = standard_factor
 
     def close(self):
         for handle in self.handles.values():
@@ -156,7 +190,8 @@ class PageCache:
     def read(self, path: Path, z_page: int, xy_factor: tuple[int, int], nearest: bool,
              standard_factor: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
         # Labels are never intensity-corrected. Distinguish corrected cache entries.
-        factor = None if nearest else standard_factor
+        factor = None if nearest else (standard_factor if standard_factor is not None
+                                       else self.standard_factor)
         key = (str(path), int(z_page), *xy_factor, bool(nearest), id(factor))
         if key in self.cache:
             self.cache.move_to_end(key)
@@ -216,6 +251,9 @@ class PageCache:
 
 def load_index(c: Config, rigid_offsets: Optional[np.ndarray] = None,
                normalize: bool = False) -> Index:
+    """Index source tiles; optional rigid_offsets are saved adjacent-layer corrections."""
+    if not np.isfinite(c.layer_z_tolerance_um) or c.layer_z_tolerance_um < 0:
+        raise ValueError("layer_z_tolerance_um must be finite and nonnegative")
     root = Path(c.dir_path)
     entries = []
     for e in os.scandir(root):
@@ -231,6 +269,17 @@ def load_index(c: Config, rigid_offsets: Optional[np.ndarray] = None,
     physical = np.array([v[2] for v in entries], dtype=np.float64)
     if c.flip_stage_xy:
         physical[:, :2] *= -1
+    if c.layer_z_tolerance_um > 0:
+        # Cluster physical coordinates before voxel rounding. Anchor each group
+        # at its minimum so a chain of close neighbors cannot span many layers.
+        z_values, z_inverse = np.unique(physical[:, 2], return_inverse=True)
+        grouped_z = np.empty_like(z_values)
+        anchor = z_values[0]
+        for i, z in enumerate(z_values):
+            if z - anchor >= c.layer_z_tolerance_um:
+                anchor = z
+            grouped_z[i] = anchor
+        physical[:, 2] = grouped_z[z_inverse]
     pos = physical / np.asarray(c.voxel_size, dtype=np.float64)
     pos = np.rint(pos - pos.min(axis=0)).astype(np.float64)
 
@@ -238,7 +287,7 @@ def load_index(c: Config, rigid_offsets: Optional[np.ndarray] = None,
     n_layers = len(starts)
     stage_origin = physical.min(axis=0)
     if rigid_offsets is not None:
-        offsets = np.asarray(rigid_offsets, dtype=np.float64)
+        offsets = accumulate_rigid_offsets(rigid_offsets)
         if offsets.shape != (n_layers, 3):
             raise ValueError(f"rigid offsets must have shape ({n_layers},3): {offsets.shape}")
         pos += offsets[layer_ids]
@@ -264,7 +313,10 @@ def load_index(c: Config, rigid_offsets: Optional[np.ndarray] = None,
 
 
 def corrected_index(c: Config, idx: Index, offsets: np.ndarray) -> Index:
-    """Apply absolute corrections without a second directory traversal."""
+    """Accumulate saved pairwise corrections without a second directory traversal."""
+    offsets = accumulate_rigid_offsets(offsets)
+    if offsets.shape != (len(idx.layer_starts),3):
+        raise ValueError('Rigid offsets must have one XYZ row per layer')
     pos = idx.positions + offsets[idx.layer_ids]
     shift = pos.min(axis=0)
     pos -= shift
@@ -550,8 +602,9 @@ def save_rigid_overlap_preview(c: Config, idx: Index, prev: int, cur: int,
     hi = math.ceil(min(idx.layer_starts[prev],idx.layer_starts[cur]+dz)+c.stack_shape[2])
     metadata = dict(reference_layer=int(prev),moving_layer=int(cur),
                     source=str(Path(c.dir_path).resolve()),
-                    coordinate_frame='Nominal normalized acquisition XYZ, with preceding rigid corrections applied; '
-                                     'before final dataset-origin normalization',
+                    coordinate_frame='Registration working XYZ, before final dataset-origin normalization; '
+                                     'automatic rigid matching initializes the moving layer with the preceding '
+                                     'absolute correction, and candidate corrections are additional residuals',
                     reference_layer_start_raw=float(idx.layer_starts[prev]),
                     moving_layer_start_raw=float(idx.layer_starts[cur]),
                     registration_channel=int(c.registration_channel),
@@ -688,7 +741,8 @@ def streaming_local_matches(c: Config, idx: Index, prev: int, cur: int, z: int,
     return points, shifts, scores
 
 
-def estimate_fields(c: Config, idx: Index, regdir: Path, signature: str) -> np.ndarray:
+def estimate_fields(c: Config, idx: Index, regdir: Path, signature: str,
+                    standard_factor: Optional[np.ndarray] = None) -> np.ndarray:
     """Estimate cumulative XY sampling fields, checkpointed after EACH layer.
 
     Cache uses strict parameter/data signatures; no incomplete calculation is treated as final.
@@ -713,7 +767,10 @@ def estimate_fields(c: Config, idx: Index, regdir: Path, signature: str) -> np.n
     if completed >= layer_num-1 or layer_num == 1:
         progress("Flexible registration complete/reused: %d layers, field shape=%s", layer_num, shape)
         return fields
-    with PageCache(min(c.cache_mb, 1024), c.cache_open_files, c.strict_input, c.stack_shape) as cache:
+    if standard_factor is None:
+        standard_factor = load_standardization(c)
+    with PageCache(min(c.cache_mb, 1024), c.cache_open_files, c.strict_input,
+                   c.stack_shape, standard_factor) as cache:
         for cur in range(max(1, completed+1), layer_num):
             layer_started = time.perf_counter()
             prev = cur-1
@@ -784,14 +841,22 @@ def write_qc(path: Path, headings: list[str], rows: list) -> None:
 
 
 def config_signature(c: Config, idx: Index, kind: str,
-                     rigid_offsets: Optional[np.ndarray] = None) -> str:
+                     rigid_offsets: Optional[np.ndarray] = None,
+                     standard_factor: Optional[np.ndarray] = None) -> str:
     """Strict deterministic source/config fingerprint to guard reuse."""
     h=hashlib.sha256()
     for dr in idx.dirs:
         h.update(dr.name.encode("utf-8")); h.update(b"\0")
+    if kind == 'geometry':
+        params = dict(source=str(Path(c.dir_path).resolve()), stack_shape=c.stack_shape,
+                      voxel_size=c.voxel_size, flip_stage_xy=c.flip_stage_xy,
+                      layer_z_tolerance_um=c.layer_z_tolerance_um)
+        h.update(json.dumps(params,sort_keys=True).encode())
+        return h.hexdigest()
     params = {"version": "auto-xyz-flex-v2", "kind":kind,
               "source":str(Path(c.dir_path).resolve()),"stack_shape":c.stack_shape,
               "voxel_size":c.voxel_size,"flip_stage_xy":c.flip_stage_xy,
+              "layer_z_tolerance_um":c.layer_z_tolerance_um,
               "channel":c.registration_channel,"strict_input":c.strict_input,
               "stop_on_registration_failure":c.stop_on_registration_failure,
               "xy_blend_overlap_ratio":c.xy_blend_overlap_ratio,
@@ -801,7 +866,17 @@ def config_signature(c: Config, idx: Index, kind: str,
                  "rigid_signal_candidates","rigid_signal_z_samples","rigid_skip_on_failure",
                  "rigid_max_z_shift_px","rigid_min_ncc","rigid_min_overlap",
                  "rigid_max_volume_megavoxels","rigid_refine_z","rigid_refine_z_planes")}}
+    params['rigid']['algorithm'] = 'adjacent-residual-pairwise-storage-v1'
+    if c.if_standardization:
+        if standard_factor is None:
+            standard_factor = load_standardization(c)
+        params["standardization"] = {
+            "algorithm":"native-yx-mean-over-profile-v1",
+            "gain_sha256":hashlib.sha256(standard_factor.tobytes()).hexdigest(),
+        }
     if kind=="flexible":
+        # Completed rigid offsets are inputs; their estimation settings are not.
+        params.pop("rigid")
         params["flexible"]={k:getattr(c,k) for k in (
             "flexible_stitch","registration_downsample","registration_mesh_px",
             "registration_patch_px","registration_z_samples","min_phase_response",
@@ -1154,28 +1229,36 @@ def rigid_pair(c:Config,idx:Index,prev:int,cur:int,cache:PageCache):
     return result, len(estimates),float(np.median([item[1] for item in estimates]))
 
 
-def estimate_rigid(c:Config,idx:Index,regdir:Path,signature:str):
-    """Sequential XYZ registration, checkpoint after every accepted layer."""
+def estimate_rigid(c:Config,idx:Index,regdir:Path,signature:str,
+                   standard_factor: Optional[np.ndarray] = None):
+    """Register adjacent layers; save/return pairwise corrections, accumulate only in memory."""
     n=len(idx.layer_starts)
     offsets=np.zeros((n,3),np.float64)
     qc=[]; completed=0
     path=regdir/'rigid_state.npz'
     if path.is_file() and not c.force_registration:
         with np.load(path,allow_pickle=False) as old:
+            if ('offset_convention' not in old.files or
+                    str(old['offset_convention'].item()) != RIGID_OFFSET_CONVENTION):
+                raise RuntimeError("Rigid checkpoint must use adjacent-layer offsets. "
+                                   "Run the rigid stage in a new registration_dir.")
             if str(old['signature'].item())!=signature or old['offsets'].shape!=offsets.shape:
                 raise RuntimeError("Rigid registration cache does not match input/settings. "
                                    "Use a new registration_dir or force_registration=True.")
-            offsets[:]=old['offsets']
+            offsets[:]=accumulate_rigid_offsets(old['offsets'])
             completed=int(old['completed'].item())
             qc=json.loads(str(old['qc_json'].item()))
         progress("Resume XYZ rigid registration: layer %d / %d",completed,n-1)
     if completed>=n-1 or n==1:
         progress("Rigid registration complete/reused: %d layers", n)
-        return offsets
-    with PageCache(min(c.cache_mb,1024),c.cache_open_files,c.strict_input,c.stack_shape) as cache:
+        return relative_rigid_offsets(offsets)
+    if standard_factor is None:
+        standard_factor = load_standardization(c)
+    with PageCache(min(c.cache_mb,1024),c.cache_open_files,c.strict_input,
+                   c.stack_shape,standard_factor) as cache:
         # Do NOT rescan hundreds of thousands of folders at each registration step.
-        # Each preceding layer is corrected exactly once; current layer remains nominal
-        # until registered. Build one mutable positional index and update only its tree.
+        # Initialize each moving layer with the preceding absolute correction.
+        # Correlation then measures a bounded residual, not accumulated drift.
         work=Index(idx.dirs,idx.positions.copy(),idx.layer_ids,idx.layer_starts.copy(),
                    idx.layer_tiles,idx.xy_min.copy(),idx.xy_max.copy(),
                    idx.z_min,idx.z_max,list(idx.layer_trees))
@@ -1188,36 +1271,44 @@ def estimate_rigid(c:Config,idx:Index,regdir:Path,signature:str):
             update_work_layer(k,offsets[k])
         for cur in range(max(1,completed+1),n):
             layer_started = time.perf_counter()
-            # Reference already registered; moving layer still at nominal coordinates.
             prev=cur-1
-            progress("Rigid layer %d/%d: reference=%d Z=%.1f, moving=%d nominal Z=%.1f",
-                     cur,n-1,prev,work.layer_starts[prev],cur,work.layer_starts[cur])
+            baseline = offsets[prev].copy()
+            update_work_layer(cur, baseline)
+            progress("Rigid layer %d/%d: reference=%d Z=%.1f, moving=%d nominal Z=%.1f, "
+                     "initial absolute XYZ=%s; limits apply to additional shift",
+                     cur,n-1,prev,work.layer_starts[prev],cur,idx.layer_starts[cur],baseline)
             failure_reason = ""
             try:
-                xyz,matches,score=rigid_pair(c,work,prev,cur,cache)
+                residual,matches,score=rigid_pair(c,work,prev,cur,cache)
+                xyz = baseline + residual
+                update_work_layer(cur, residual)
+                progress("Rigid layer %d: adjacent residual XYZ=%s, absolute XYZ=%s",cur,residual,xyz)
             except RigidRegistrationError as exc:
                 if not c.rigid_skip_on_failure and c.stop_on_registration_failure:
                     raise
-                progress("WARNING: Skipping rigid alignment %d->%d: %s; keeping nominal stage "
-                         "position (zero absolute XYZ correction)",prev,cur,exc)
+                progress("WARNING: Skipping rigid alignment %d->%d: %s; using zero adjacent "
+                         "correction and inheriting the preceding layer's correction",prev,cur,exc)
                 failure_reason = str(exc)
-                xyz=np.zeros(3,np.float64);matches=0;score=float('nan')
+                residual=np.zeros(3,np.float64);xyz=baseline.copy();matches=0;score=float('nan')
             offsets[cur]=xyz
             completed=cur
-            qc.append([prev,cur,*xyz.tolist(),matches,score,
-                       work.layer_starts[prev],work.layer_starts[cur],
-                       "ok" if matches else "skipped_nominal",failure_reason])
-            update_work_layer(cur, xyz)
+            qc.append([prev,cur,*residual.tolist(),matches,score,
+                       work.layer_starts[prev],idx.layer_starts[cur],
+                       "ok" if matches else "skipped_inherited",failure_reason])
+            saved_relative = relative_rigid_offsets(offsets)
+            saved_relative[completed+1:] = 0
             atomic_savez(path,signature=np.asarray(signature),completed=np.asarray(completed),
-                         offsets=offsets,qc_json=np.asarray(json.dumps(qc)))
+                         geometry_signature=np.asarray(config_signature(c,idx,'geometry')),
+                         offset_convention=np.asarray(RIGID_OFFSET_CONVENTION),
+                         offsets=saved_relative,qc_json=np.asarray(json.dumps(qc)))
             write_qc(regdir/'rigid_registration_qc.csv',
                      ['prev_layer','moving_layer','correction_x_raw','correction_y_raw',
                       'correction_z_raw','accepted_rois','median_ncc',
                       'ref_layer_z_start','moving_nominal_z_start','status','reason'],qc)
-            progress("Rigid checkpoint: layer %d/%d absolute offset XYZ=%s",cur,n-1,xyz)
+            progress("Rigid checkpoint: layer %d/%d adjacent offset XYZ=%s",cur,n-1,residual)
             progress("Rigid layer %d complete: accepted ROIs=%d, median NCC=%.4f, checkpoint=%s, elapsed=%.1fs",
                      cur,matches,score,path,time.perf_counter()-layer_started)
-        return offsets
+        return relative_rigid_offsets(offsets)
 
 
 def candidate_ids(c: Config, idx: Index, layer: int,
@@ -1430,10 +1521,13 @@ def load_standardization(c: Config) -> Optional[np.ndarray]:
 
 def write_rigid_edit_checkpoint(c: Config, idx: Index, regdir: Path,
                                 signature: str, offsets: np.ndarray) -> None:
-    """Publish an editable absolute-offset CSV without overwriting manual edits."""
+    """Publish adjacent-layer XYZ corrections without overwriting manual edits."""
+    accumulate_rigid_offsets(offsets)  # validate the public pairwise representation
     state_path = regdir/"rigid_state.npz"
     if not state_path.exists() or not c.rigid_stitch or (c.force_registration and len(offsets) == 1):
         atomic_savez(state_path, signature=np.asarray(signature), offsets=offsets,
+                     offset_convention=np.asarray(RIGID_OFFSET_CONVENTION),
+                     geometry_signature=np.asarray(config_signature(c,idx,'geometry')),
                      completed=np.int64(len(offsets)-1), qc_json=np.asarray("[]"))
     path = regdir/"rigid_offsets.csv"
     if path.exists() and not c.force_registration:
@@ -1443,30 +1537,47 @@ def write_rigid_edit_checkpoint(c: Config, idx: Index, regdir: Path,
     with np.load(state_path,allow_pickle=False) as state:
         for row in json.loads(str(state['qc_json'].item())):
             statuses[int(row[1])] = str(row[9])
-    rows = [[layer,float(idx.layer_starts[layer]),*offsets[layer].tolist(),
-             statuses.get(layer,"reference" if layer == 0 else "ok"),""]
-            for layer in range(len(offsets))]
     if path.exists():
         backup = path.with_name(path.name+".bak")
         backup.write_bytes(path.read_bytes())
         progress("Backed up previous editable rigid offsets: %s",backup)
-    write_qc(path,["layer","nominal_z_raw","dx_raw","dy_raw","dz_raw","status","note"],rows)
-    progress("Editable rigid checkpoint saved: %s (absolute XYZ corrections in raw voxels)",path)
+    write_pairwise_rigid_csv(path, idx, offsets, statuses)
+    progress("Editable rigid checkpoint saved: %s (adjacent-layer XYZ corrections in raw voxels)",path)
 
 
-def load_rigid_checkpoint(c: Config, idx: Index, regdir: Path, signature: str) -> np.ndarray:
-    """Read completed rigid state; editable CSV overrides the automatic offsets."""
+def write_pairwise_rigid_csv(path: Path, idx: Index, offsets: np.ndarray,
+                            statuses: Optional[dict] = None, notes: Optional[dict] = None) -> None:
+    statuses, notes = statuses or {}, notes or {}
+    rows = [[layer,layer-1,float(idx.layer_starts[layer]),*offsets[layer].tolist(),
+             RIGID_OFFSET_CONVENTION, statuses.get(layer,'reference' if layer == 0 else 'ok'),
+             notes.get(layer,'')] for layer in range(len(offsets))]
+    write_qc(path,['layer','prev_layer','nominal_z_raw','dx_raw','dy_raw','dz_raw',
+                   'offset_convention','status','note'],rows)
+
+
+def load_rigid_checkpoint(c: Config, idx: Index, regdir: Path, signature: str,
+                          reuse_completed: bool = False) -> np.ndarray:
+    """Return pairwise corrections; CSV overrides automatic estimates before accumulation."""
     path = regdir/"rigid_state.npz"
     if not path.is_file():
         raise RuntimeError("Missing rigid checkpoint. Run workflow_stage='rigid' first.")
     count = len(idx.layer_starts)
     with np.load(path,allow_pickle=False) as state:
-        if str(state['signature'].item()) != signature:
+        mismatch = str(state['signature'].item()) != signature
+        if mismatch and not reuse_completed:
             raise RuntimeError("Rigid checkpoint does not match source/settings. Use the same rigid "
                                "configuration, or run the rigid stage in a new registration_dir.")
         if int(state['completed'].item()) != count-1:
             raise RuntimeError("Rigid checkpoint is incomplete. Resume workflow_stage='rigid' first.")
+        if ('geometry_signature' not in state.files or
+                str(state['geometry_signature'].item()) != config_signature(c,idx,'geometry')):
+            raise RuntimeError("Rigid checkpoint source geometry does not match current input. "
+                               "Check dir_path, tile folders, stack_shape, voxel_size, flip_stage_xy "
+                               "and layer_z_tolerance_um against the rigid-stage configuration.")
         offsets = np.asarray(state['offsets'],dtype=np.float64).copy()
+        if ('offset_convention' not in state.files or
+                str(state['offset_convention'].item()) != RIGID_OFFSET_CONVENTION):
+            raise ValueError('Rigid checkpoint must use adjacent-layer offsets')
     if offsets.shape != (count,3) or not np.all(np.isfinite(offsets)):
         raise ValueError("Rigid checkpoint offsets must be a finite [layers,3] XYZ array")
     csv_path = regdir/"rigid_offsets.csv"
@@ -1475,13 +1586,17 @@ def load_rigid_checkpoint(c: Config, idx: Index, regdir: Path, signature: str) -
         seen = set()
         with csv_path.open(newline='',encoding='utf-8-sig') as stream:
             reader = csv.DictReader(stream)
-            required = {'layer','nominal_z_raw','dx_raw','dy_raw','dz_raw'}
+            required = {'layer','prev_layer','nominal_z_raw','dx_raw','dy_raw','dz_raw','offset_convention'}
             if not required.issubset(reader.fieldnames or []):
                 raise ValueError(f"{csv_path}: required columns are {sorted(required)}")
             for row in reader:
                 layer = int(row['layer'])
                 if layer in seen or not 0 <= layer < count:
                     raise ValueError(f"{csv_path}: duplicate or invalid layer {layer}")
+                if row['offset_convention'] != RIGID_OFFSET_CONVENTION:
+                    raise ValueError(f'{csv_path}: expected adjacent-layer offset_convention')
+                if int(row['prev_layer']) != layer-1:
+                    raise ValueError(f'{csv_path}: prev_layer must be layer-1')
                 if not np.isclose(float(row['nominal_z_raw']),idx.layer_starts[layer],rtol=0,atol=1e-6):
                     raise ValueError(f"{csv_path}: nominal Z does not match layer {layer}")
                 offsets[layer] = [float(row[key]) for key in ('dx_raw','dy_raw','dz_raw')]
@@ -1495,6 +1610,9 @@ def load_rigid_checkpoint(c: Config, idx: Index, regdir: Path, signature: str) -
         progress("Loaded editable rigid checkpoint: %s, %d manually changed layers",csv_path,len(changed))
     if np.any(offsets[0] != 0):
         raise ValueError("Rigid reference layer 0 must retain XYZ correction [0,0,0]")
+    if mismatch and reuse_completed:
+        progress("Reusing completed rigid offsets; rigid estimation settings/profile changes do not rerun rigid registration")
+    accumulate_rigid_offsets(offsets)
     return offsets
 
 
@@ -1521,8 +1639,10 @@ def load_flexible_checkpoint(c: Config, idx: Index, regdir: Path, signature: str
 
 
 def save_checkpoint_overlap_previews(c: Config, idx: Index, regdir: Path,
-                                     offsets: np.ndarray) -> None:
-    """Review the edited rigid checkpoint without rerunning registration."""
+                                     offsets: np.ndarray,
+                                     standard_factor: Optional[np.ndarray] = None) -> None:
+    """Accumulate and review edited pairs without rerunning registration."""
+    offsets = accumulate_rigid_offsets(offsets)
     if not c.save_registration_previews:
         progress("Overlap previews disabled by save_registration_previews=False")
         return
@@ -1534,7 +1654,10 @@ def save_checkpoint_overlap_previews(c: Config, idx: Index, regdir: Path,
                    layer_trees=[cKDTree(pos[ids,:2]+np.asarray(c.stack_shape[:2])/2)
                                 for ids in idx.layer_tiles])
     root = registration_preview_root(c)/'checkpoint_review'/f'attempt_{time.time_ns()}'
-    with PageCache(c.cache_mb,c.cache_open_files,c.strict_input,c.stack_shape) as cache:
+    if standard_factor is None:
+        standard_factor = load_standardization(c)
+    with PageCache(c.cache_mb,c.cache_open_files,c.strict_input,
+                   c.stack_shape,standard_factor) as cache:
         for cur in range(1,len(idx.layer_starts)):
             prev = cur-1
             name = f'layer_{prev:04d}_to_{cur:04d}'
@@ -1558,9 +1681,12 @@ def save_checkpoint_overlap_previews(c: Config, idx: Index, regdir: Path,
             for number,(cx,cy) in enumerate(centers,1):
                 folder = root/name/f'roi_{number:03d}'
                 details = dict(effective_reference_correction_xyz_raw=offsets[prev].tolist(),
-                               effective_moving_correction_xyz_raw=offsets[cur].tolist())
-                save_rigid_overlap_preview(c,view,prev,cur,cx,cy,cache,folder/'nominal_moving',
-                                           -offsets[cur],status='reference_corrected_moving_nominal',**details)
+                               effective_moving_correction_xyz_raw=offsets[cur].tolist(),
+                               adjacent_correction_xyz_raw=(offsets[cur]-offsets[prev]).tolist(),
+                               offset_convention=RIGID_OFFSET_CONVENTION)
+                save_rigid_overlap_preview(c,view,prev,cur,cx,cy,cache,folder/'before_pair_correction',
+                                           offsets[prev]-offsets[cur],
+                                           status='moving_initialized_with_preceding_correction',**details)
                 save_rigid_overlap_preview(c,view,prev,cur,cx,cy,cache,folder/'corrected',
                                            [0,0,0],status='edited_rigid_checkpoint_applied',**details)
     progress("Rigid checkpoint overlap review saved: %s",root)
@@ -1627,8 +1753,8 @@ def run(c: Config) -> None:
         limits = np.asarray(c.subregion_range, dtype=float)
         if limits.shape != (3, 2) or not np.all(np.isfinite(limits)) or np.any(limits[:, 1] <= limits[:, 0]):
             raise ValueError("subregion_range requires finite increasing XYZ bounds")
-    # This is an export correction; cached geometric registration remains reusable.
-    standard_factor = load_standardization(c) if do_export else None
+    # Correct native detector pixels consistently in registration, review and export.
+    standard_factor = load_standardization(c)
     outdir = Path(c.export_path)
     if do_export:
         outdir.mkdir(parents=True, exist_ok=True)
@@ -1642,31 +1768,40 @@ def run(c: Config) -> None:
             raise RuntimeError("LZW requires imagecodecs: pip install imagecodecs") from exc
     if c.registration_channel >= c.ch_num:
         raise ValueError("registration_channel must reference a raw signal channel")
-    rigid_sig=config_signature(c,raw_index,'rigid')
+    rigid_sig=config_signature(c,raw_index,'rigid',standard_factor=standard_factor)
     if stage in ('all','rigid'):
-        rigid_offsets=(estimate_rigid(c,raw_index,regdir,rigid_sig) if c.rigid_stitch
+        pair_offsets=(estimate_rigid(c,raw_index,regdir,rigid_sig,standard_factor) if c.rigid_stitch
                        else np.zeros((len(raw_index.layer_starts),3),np.float64))
-        write_rigid_edit_checkpoint(c,raw_index,regdir,rigid_sig,rigid_offsets)
-    rigid_offsets=(load_rigid_checkpoint(c,raw_index,regdir,rigid_sig) if c.rigid_stitch
+        write_rigid_edit_checkpoint(c,raw_index,regdir,rigid_sig,pair_offsets)
+    pair_offsets=(load_rigid_checkpoint(c,raw_index,regdir,rigid_sig,
+                                        reuse_completed=stage in ('flexible','export','preview')) if c.rigid_stitch
                    else np.zeros((len(raw_index.layer_starts),3),np.float64))
+    # Only internal geometry uses cumulative offsets. All saved/editable offsets are pairwise.
+    rigid_offsets = accumulate_rigid_offsets(pair_offsets)
+    if c.rigid_stitch:
+        with np.load(regdir/'rigid_state.npz',allow_pickle=False) as state:
+            rigid_sig = str(state['signature'].item())
     if stage == 'preview':
-        save_checkpoint_overlap_previews(c,raw_index,regdir,rigid_offsets)
+        save_checkpoint_overlap_previews(c,raw_index,regdir,pair_offsets,standard_factor)
         return
     if stage != 'export':
         tmp = regdir/"rigid_offsets_raw_xyz.npy.partial"
         with tmp.open('wb') as stream:
-            np.save(stream,rigid_offsets)
+            np.save(stream,pair_offsets)
         os.replace(tmp,regdir/"rigid_offsets_raw_xyz.npy")
     if stage == 'rigid':
-        progress("Rigid stage complete. Edit %s, then run workflow_stage='flexible'.",
-                 regdir/"rigid_offsets.csv")
+        progress("Rigid stage complete. Edit %s, then run workflow_stage='%s'.",
+                 regdir/"rigid_offsets.csv", 'flexible' if c.flexible_stitch else 'export')
         return
-    index=corrected_index(c,raw_index,rigid_offsets)
-    flex_sig=config_signature(c,index,'flexible',rigid_offsets)
+    index=corrected_index(c,raw_index,pair_offsets)
+    flex_sig=config_signature(c,index,'flexible',rigid_offsets,standard_factor)
     if c.flexible_stitch:
         fields=(load_flexible_checkpoint(c,index,regdir,flex_sig) if stage == 'export'
-                else estimate_fields(c,index,regdir,flex_sig))
+                else estimate_fields(c,index,regdir,flex_sig,standard_factor))
     else:
+        if stage == 'export':
+            progress("Exporting with flexible registration disabled; using %s positions only.",
+                     'saved rigid' if c.rigid_stitch else 'nominal stage')
         gx,gy=field_grid(c,index)
         fields=np.zeros((len(index.layer_starts),len(gy),len(gx),2),np.float32)
     if stage != 'export':
@@ -1679,12 +1814,13 @@ def run(c: Config) -> None:
         manifest={"source":str(Path(c.dir_path).resolve()),"layers":len(index.layer_starts),
                   "rigid_signature":rigid_sig,"flexible_signature":flex_sig,
                   "rigid_stitch":c.rigid_stitch,"flexible_stitch":c.flexible_stitch,
-                  "rigid_offset_units":"raw XY and Z voxels, absolute w.r.t. nominal stage",
+                  "rigid_offset_units":"raw XYZ voxels, additional correction relative to preceding layer",
+                  "rigid_offset_convention":RIGID_OFFSET_CONVENTION,
                   "rigid_offset_axes":"X,Y,Z",
                   "rigid_edit_checkpoint":"rigid_offsets.csv (overrides automatic rigid_state.npz)",
                   "flexible_field_axes":"control_Y,control_X,channel_XY",
                   "flexible_field_units":"raw XY pixels, output-to-source sampling displacement",
-                  "rigid_offsets":rigid_offsets.tolist(),
+                  "rigid_offsets":pair_offsets.tolist(),
                   "normalized_origin_stage_xyz_um":index.stage_origin_um.tolist(),
                   "parameters":{key:(value if isinstance(value,(str,int,float,bool,type(None)))
                                      else list(value) if isinstance(value,tuple) else value)
@@ -1745,7 +1881,8 @@ def run(c: Config) -> None:
         "registration_downsample": c.registration_downsample,
         "registration_dir": str(regdir),
         "rigid_stitch": c.rigid_stitch,
-        "rigid_offsets_xyz_raw": rigid_offsets.tolist(),
+        "rigid_offsets_xyz_raw": pair_offsets.tolist(),
+        "rigid_offset_convention": RIGID_OFFSET_CONVENTION,
         "rigid_registration_signature": rigid_sig,
         "flexible_registration_signature": flex_sig,
         "output_settings": {

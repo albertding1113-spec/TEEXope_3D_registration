@@ -44,6 +44,36 @@ class StitchTests(unittest.TestCase):
         dest.mkdir(parents=True, exist_ok=True)
         tifffile.imwrite(dest / channel, data, photometric='minisblack')
 
+    def test_nearby_z_coordinates_share_layer_and_source_pages(self):
+        # Same XY and slightly different folder Z: retain both source stacks.
+        for z in ('05378.000', '05378.196', '05378.900', '05379.000', '05379.800'):
+            data = np.broadcast_to(np.arange(8, dtype=np.uint16)[:, None, None], (8, 4, 4))
+            self.tile(f'X154599.900_Y54873.200_Z{z}', data)
+        c = self.config(stack_shape=(4, 4, 8), voxel_size=(.1489, .1489, .1))
+        idx = stitch.load_index(c)
+        np.testing.assert_array_equal(idx.layer_ids, [0, 0, 0, 1, 1])
+        np.testing.assert_array_equal(idx.positions[:, 2], [0, 0, 0, 10, 10])
+        np.testing.assert_array_equal(idx.layer_starts, [0, 10])
+        self.assertEqual([len(ids) for ids in idx.layer_tiles], [3, 2])
+        # Every stack in a grouped layer contributes the same local Z page.
+        with stitch.PageCache(8) as cache:
+            image, valid = stitch.layer_mosaic(c, idx, 0, 3, 1, cache)
+        np.testing.assert_array_equal(image[valid], 3)
+        offsets = np.array([[0, 0, 0], [2, 3, -1]])
+        shifted = stitch.load_index(c, offsets, normalize=True)
+        corrected = stitch.corrected_index(c, idx, offsets)
+        np.testing.assert_array_equal(shifted.positions, corrected.positions)
+        np.testing.assert_array_equal(shifted.layer_starts, [0, 9])
+        # Zero restores legacy voxel grouping; changed grouping invalidates caches.
+        legacy = replace(c, layer_z_tolerance_um=0)
+        self.assertEqual(len(stitch.load_index(legacy).layer_starts), 5)
+        for kind in ('geometry', 'rigid', 'flexible'):
+            self.assertNotEqual(stitch.config_signature(c, idx, kind),
+                                stitch.config_signature(legacy, idx, kind))
+        for tolerance in (-1, float('nan'), float('inf')):
+            with self.assertRaisesRegex(ValueError, 'layer_z_tolerance_um'):
+                stitch.load_index(replace(c, layer_z_tolerance_um=tolerance))
+
     def scene(self):
         rng = np.random.default_rng(123)
         return (1000 + 1500 * gaussian_filter(rng.random((110, 160, 160)), (.6, 1, 1))).astype(np.uint16)
@@ -67,7 +97,7 @@ class StitchTests(unittest.TestCase):
             self.assertEqual(int(state['completed']), 1)
         stitch.run(c)
         offsets = np.load(self.root / 'registration' / 'rigid_offsets_raw_xyz.npy')
-        np.testing.assert_allclose(offsets, truth, atol=1)
+        np.testing.assert_allclose(stitch.accumulate_rigid_offsets(offsets), truth, atol=1)
         with patch.object(stitch, 'rigid_pair', side_effect=AssertionError('cache missed')):
             stitch.run(c)
         out = replace(c, registration_only=False, if_subregion=True,
@@ -88,6 +118,62 @@ class StitchTests(unittest.TestCase):
         np.testing.assert_array_equal(tifffile.imread(files[0]), expected)
         with self.assertRaisesRegex(RuntimeError, 'different export'):
             stitch.run(replace(out, if_xy_blend=False))
+
+    def test_rigid_cumulative_drift_exceeds_pair_limits_and_resumes(self):
+        rng = np.random.default_rng(567)
+        scene = (1000 + 1500 * gaussian_filter(rng.random((130, 190, 190)),
+                                              (.6, 1, 1))).astype(np.uint16)
+        truth = np.arange(4)[:, None] * np.array([8, -4, 2])
+        for k, (dx, dy, dz) in enumerate(truth):
+            nominal = 20 * k
+            self.tile(f'X1000_Y2000_Z{3000+nominal}',
+                      scene[10+nominal+dz:50+nominal+dz, 30+dy:158+dy, 10+dx:138+dx])
+        c = self.config(rigid_max_xy_shift_px=10, rigid_max_z_shift_px=3,
+                        rigid_z_downsample=1, rigid_refine_z=False,
+                        save_registration_previews=False, registration_only=True)
+        real_pair = stitch.rigid_pair
+        def interrupted(cfg, work, prev, cur, cache):
+            if cur == 2:
+                raise RuntimeError('simulated interruption')
+            return real_pair(cfg, work, prev, cur, cache)
+        with patch.object(stitch, 'rigid_pair', side_effect=interrupted):
+            with self.assertRaisesRegex(RuntimeError, 'simulated interruption'):
+                stitch.run(c)
+        with np.load(self.root / 'registration' / 'rigid_state.npz') as state:
+            self.assertEqual(int(state['completed']), 1)
+            np.testing.assert_allclose(state['offsets'][1], truth[1], atol=1)
+        stitch.run(c)
+        offsets = np.load(self.root / 'registration' / 'rigid_offsets_raw_xyz.npy')
+        np.testing.assert_allclose(offsets, [[0,0,0],[8,-4,2],[8,-4,2],[8,-4,2]], atol=1)
+        with np.load(self.root/'registration'/'rigid_state.npz') as state:
+            np.testing.assert_allclose(state['offsets'], offsets)
+            self.assertEqual(str(state['offset_convention'].item()),stitch.RIGID_OFFSET_CONVENTION)
+        with (self.root/'registration'/'rigid_offsets.csv').open(newline='') as stream:
+            rows = list(csv.DictReader(stream))
+        np.testing.assert_allclose([[float(r[key]) for key in ('dx_raw','dy_raw','dz_raw')]
+                                    for r in rows], offsets)
+        self.assertEqual([int(r['prev_layer']) for r in rows],[-1,0,1,2])
+        manifest = json.loads((self.root/'registration'/'registration_manifest.json').read_text())
+        np.testing.assert_allclose(manifest['rigid_offsets'], offsets)
+        self.assertEqual(manifest['rigid_offset_convention'],stitch.RIGID_OFFSET_CONVENTION)
+        with (self.root/'registration'/'rigid_registration_qc.csv').open(newline='') as stream:
+            qc = list(csv.DictReader(stream))
+        np.testing.assert_allclose([[float(r[key]) for key in
+                                    ('correction_x_raw','correction_y_raw','correction_z_raw')]
+                                    for r in qc], offsets[1:])
+        absolute = stitch.accumulate_rigid_offsets(offsets)
+        np.testing.assert_allclose(absolute, truth, atol=1)
+        self.assertGreater(absolute[-1, 0], c.rigid_max_xy_shift_px)
+        self.assertGreater(absolute[-1, 2], c.rigid_max_z_shift_px)
+        with patch.object(stitch, 'rigid_pair', side_effect=AssertionError('cache missed')):
+            stitch.run(c)
+        # Large accumulated drift is allowed; excessive adjacent residuals are not.
+        for name, limits in (('xy', dict(rigid_max_xy_shift_px=6)),
+                             ('z', dict(rigid_max_z_shift_px=1))):
+            strict = replace(c, registration_dir=str(self.root / f'limited-{name}'),
+                             rigid_skip_on_failure=False, **limits)
+            with self.assertRaises(stitch.RigidRegistrationError):
+                stitch.run(strict)
 
     def test_flexible_cumulative_shift_and_memory_bound(self):
         scene = self.scene()
@@ -226,6 +312,79 @@ class StitchTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'different export'):
             stitch.run_export(c)
 
+    def test_export_saved_rigid_only_honors_edits_and_ignores_flexible(self):
+        for z, value in ((3000, 100), (3002, 200)):
+            self.tile(f'X1000_Y2000_Z{z}', np.full((4, 8, 8), value, np.uint16))
+        c = self.config(stack_shape=(8, 8, 4), flexible_stitch=False,
+                        save_registration_previews=False, workflow_stage='rigid')
+        stitch.run(c)
+        self.edit_rigid_csv(1, [2, 0, 1])
+        regdir = self.root / 'registration'
+        # Even an unreadable flexible checkpoint must be ignored by rigid-only export.
+        (regdir / 'flexible_state.npz').write_bytes(b'unused flexible checkpoint')
+        before = {p.name: p.read_bytes() for p in regdir.iterdir() if p.is_file()}
+        with (patch.object(stitch, 'estimate_rigid', side_effect=AssertionError('rigid rerun')),
+              patch.object(stitch, 'estimate_fields', side_effect=AssertionError('flexible rerun')),
+              patch.object(stitch, 'load_flexible_checkpoint', side_effect=AssertionError('flexible read'))):
+            stitch.run_export(c)
+        metadata = json.loads((self.root / 'out' / 'export_metadata.json').read_text())
+        self.assertTrue(metadata['rigid_stitch'])
+        self.assertFalse(metadata['flexible_stitch'])
+        self.assertEqual(metadata['rigid_offsets_xyz_raw'], [[0, 0, 0], [2, 0, 1]])
+        self.assertEqual(metadata['shape_xyz'], [10, 8, 7])
+        # At global Z=4 only the moving stack remains; its X origin is now 2.
+        image = tifffile.imread(self.root / 'out' / 'ch00_z000004.tif')
+        np.testing.assert_array_equal(image[:, :2], 0)
+        np.testing.assert_array_equal(image[:, 2:], 200)
+        self.assertEqual({p.name: p.read_bytes() for p in regdir.iterdir() if p.is_file()}, before)
+
+    def test_pairwise_csv_edit_propagates_through_flexible_preview_and_export(self):
+        for k in range(4):
+            self.tile(f'X1000_Y2000_Z{3000+2*k}', np.full((4,8,8),100+50*k,np.uint16))
+        c = self.config(stack_shape=(8,8,4), save_registration_previews=False,
+                        flexible_stitch=True, stop_on_registration_failure=False)
+        stitch.run_rigid(c)
+        for layer, shift in enumerate(([0,0,0],[1,0,0],[2,0,0],[3,0,0])):
+            self.edit_rigid_csv(layer, shift)
+        stitch.run_flexible(c)
+        pairwise = np.array([[0,0,0],[1,0,0],[2,0,0],[3,0,0]])
+        direct = stitch.load_index(c,pairwise,normalize=True)
+        corrected = stitch.corrected_index(c,stitch.load_index(c),pairwise)
+        np.testing.assert_array_equal(direct.positions,[[0,0,0],[1,0,2],[3,0,4],[6,0,6]])
+        np.testing.assert_array_equal(direct.positions,corrected.positions)
+        with np.load(self.root/'registration'/'tile_index.npz') as saved:
+            np.testing.assert_array_equal(saved['corrected_positions_xyz'],
+                                          [[0,0,0],[1,0,2],[3,0,4],[6,0,6]])
+        stitch.run_export(c)
+        image = tifffile.imread(self.root/'out'/'ch00_z000008.tif')
+        np.testing.assert_array_equal(image[:,:6],0)
+        np.testing.assert_array_equal(image[:,6:],250)
+        # Edit only the first pair: every subsequent layer changes, without editing its row.
+        self.edit_rigid_csv(1,[2,1,1])
+        with self.assertRaisesRegex(RuntimeError, 'Flexible checkpoint is stale'):
+            stitch.run_export(c)
+        edited = replace(c, flexible_stitch=False, export_path=str(self.root/'edited'))
+        stitch.run_export(edited)
+        metadata = json.loads((self.root/'edited'/'export_metadata.json').read_text())
+        self.assertEqual(metadata['rigid_offset_convention'],stitch.RIGID_OFFSET_CONVENTION)
+        self.assertEqual(metadata['rigid_offsets_xyz_raw'],[[0,0,0],[2,1,1],[2,0,0],[3,0,0]])
+        self.assertEqual(metadata['shape_xyz'],[15,9,11])
+        image = tifffile.imread(self.root/'edited'/'ch00_z000010.tif')
+        np.testing.assert_array_equal(image[0],0)
+        np.testing.assert_array_equal(image[1:,:7],0)
+        np.testing.assert_array_equal(image[1:,7:],250)
+        with patch.object(stitch,'save_checkpoint_overlap_previews') as preview:
+            stitch.run(replace(edited,workflow_stage='preview'))
+        np.testing.assert_array_equal(preview.call_args.args[3],
+                                      [[0,0,0],[2,1,1],[2,0,0],[3,0,0]])
+        stitch.run(replace(edited,workflow_stage='preview',save_registration_previews=True))
+        previews = list((self.root/'registration'/'overlap_previews'/'checkpoint_review').glob(
+            'attempt_*/layer_0001_to_0002/roi_*/before_pair_correction/metadata.json'))
+        self.assertTrue(previews)
+        before = json.loads(previews[-1].read_text())
+        self.assertEqual(before['adjacent_correction_xyz_raw'],[2,0,0])
+        self.assertEqual(before['moving_placement_correction_xyz_raw'],[-2,0,0])
+
     def test_independent_stages_require_complete_checkpoints_and_valid_edits(self):
         for z in (3000,3020):
             self.tile(f'X1000_Y2000_Z{z}',np.zeros((40,128,128),np.uint16))
@@ -322,7 +481,7 @@ class StitchTests(unittest.TestCase):
         np.testing.assert_array_equal(np.load(self.root/'registration'/'rigid_offsets_raw_xyz.npy'),0)
         with (self.root/'registration'/'rigid_registration_qc.csv').open(newline='') as stream:
             row = list(csv.DictReader(stream))[0]
-        self.assertEqual(row['status'],'skipped_nominal')
+        self.assertEqual(row['status'],'skipped_inherited')
         self.assertIn('signal-bearing',row['reason'])
         self.assertFalse(tifffile.imread(self.root/'out'/'ch00_z000020.tif').any())
         with patch.object(stitch,'rigid_pair',side_effect=AssertionError('cache missed')):
@@ -331,7 +490,7 @@ class StitchTests(unittest.TestCase):
         with self.assertRaises(stitch.RigidRegistrationError):
             stitch.run(strict)
 
-    def test_skipped_rigid_layer_keeps_absolute_nominal_and_continues(self):
+    def test_skipped_rigid_layer_saves_zero_pair_shift_and_continues(self):
         for k in range(4):
             self.tile(f'X1000_Y2000_Z{3000+20*k}',np.ones((40,128,128),np.uint16))
         c = self.config(registration_only=True)
@@ -341,13 +500,15 @@ class StitchTests(unittest.TestCase):
                 return np.array([4.,2.,1.]),1,.9
             if cur == 2:
                 raise stitch.RigidRegistrationError('sparse overlap')
-            np.testing.assert_array_equal(work.positions[work.layer_tiles[2]][0],[0,0,40])
+            np.testing.assert_array_equal(work.positions[work.layer_tiles[2]][0],[4,2,41])
             return np.array([1.,2.,0.]),1,.8
         with patch.object(stitch,'rigid_pair',side_effect=pair) as mocked:
             stitch.run(c)
         self.assertEqual(mocked.call_count,3)
         offsets = np.load(self.root/'registration'/'rigid_offsets_raw_xyz.npy')
         np.testing.assert_array_equal(offsets,[[0,0,0],[4,2,1],[0,0,0],[1,2,0]])
+        np.testing.assert_array_equal(stitch.accumulate_rigid_offsets(offsets),
+                                      [[0,0,0],[4,2,1],[4,2,1],[5,4,1]])
         # A real input error is not converted to a skipped alignment.
         with patch.object(stitch,'rigid_pair',side_effect=OSError('unreadable TIFF')):
             with self.assertRaisesRegex(OSError,'unreadable TIFF'):
@@ -389,6 +550,103 @@ class StitchTests(unittest.TestCase):
         tifffile.imwrite(path,profile[:,::-1],photometric='minisblack')
         with self.assertRaisesRegex(RuntimeError,'different export'):
             stitch.run(c)
+
+    def test_standardization_in_rigid_flexible_and_checkpoint_previews(self):
+        scene = self.scene().astype(np.float32)
+        yy, xx = np.mgrid[:128, :128]
+        profile = (0.25 + 0.75 * (xx / 127) * (yy / 127)).astype(np.float32)
+        path = self.root/'illumination.tif'
+        tifffile.imwrite(path, profile, photometric='minisblack')
+        for nominal, dx in ((0, 0), (20, 4)):
+            self.tile(f'X1000_Y2000_Z{3000+nominal}',
+                      scene[10+nominal:50+nominal, 10:138, 10+dx:138+dx] * profile)
+        c = self.config(workflow_stage='rigid', flexible_stitch=True,
+                        if_standardization=True, stand_img_path=str(path),
+                        save_registration_previews=True)
+        real_read = stitch.PageCache.read
+        counts = {}
+        stage = 'rigid'
+        def checked_read(cache, source, z, factors, nearest, standard_factor=None):
+            self.assertIsNotNone(cache.standard_factor)
+            actual = real_read(cache, source, z, factors, nearest, standard_factor)
+            with tifffile.TiffFile(source) as handle:
+                native = handle.pages[z].asarray().astype(np.float32)
+            corrected = native * (profile.mean(dtype=np.float64) / profile).astype(np.float32)
+            dx, dy = factors
+            expected = np.array([[corrected[y:y+dy, x:x+dx].mean()
+                                  for x in range(0, 128, dx)]
+                                 for y in range(0, 128, dy)], np.float32)
+            np.testing.assert_allclose(actual, expected, rtol=2e-6)
+            counts[stage] = counts.get(stage, 0) + 1
+            return actual
+        with patch.object(stitch.PageCache, 'read', new=checked_read):
+            with patch.object(stitch, 'load_standardization', wraps=stitch.load_standardization) as load:
+                stitch.run(c)
+                self.assertEqual(load.call_count, 1)
+            offsets = np.load(self.root/'registration'/'rigid_offsets_raw_xyz.npy')
+            np.testing.assert_allclose(offsets[1], [4, 0, 0], atol=1.1)
+            stage = 'flexible'
+            stitch.run_flexible(c)
+            stage = 'preview'
+            stitch.run(replace(c, workflow_stage='preview'))
+        self.assertTrue(all(counts.get(name, 0) > 0 for name in ('rigid', 'flexible', 'preview')))
+        idx = stitch.load_index(c)
+        offsets = np.load(self.root/'registration'/'rigid_offsets_raw_xyz.npy')
+        corrected_idx = stitch.corrected_index(c, idx, offsets)
+        old_flex = stitch.config_signature(c, corrected_idx, 'flexible', offsets)
+        # Replacing the calibration at the same path invalidates both stages.
+        tifffile.imwrite(path, profile[:, ::-1], photometric='minisblack')
+        self.assertNotEqual(old_flex, stitch.config_signature(c, corrected_idx, 'flexible', offsets))
+        with self.assertRaisesRegex(RuntimeError, 'Rigid registration cache does not match'):
+            stitch.run(c)
+        with self.assertRaisesRegex(RuntimeError, 'cache is incompatible'):
+            stitch.run_flexible(c)
+        with self.assertRaisesRegex(RuntimeError, 'does not match'):
+            stitch.run(replace(c, if_standardization=False))
+
+    def test_reuse_rigid_offsets_with_changed_estimation_settings(self):
+        for z in (3000,3020):
+            self.tile(f'X1000_Y2000_Z{z}',np.zeros((40,128,128),np.uint16))
+        c = self.config(flexible_stitch=True, stop_on_registration_failure=False)
+        stitch.run_rigid(c)
+        self.edit_rigid_csv(1,[2,-3,1])
+        csv_path = self.root/'registration'/'rigid_offsets.csv'
+        csv_before = csv_path.read_bytes()
+        state_path = self.root/'registration'/'rigid_state.npz'
+        state_before = state_path.read_bytes()
+        profile = self.root/'illumination.tif'
+        tifffile.imwrite(profile,np.ones((128,128),np.float32),photometric='minisblack')
+        changed = replace(c, rigid_xy_downsample=4, rigid_z_downsample=1,
+                          rigid_roi_px=96, rigid_refine_z=False,
+                          if_standardization=True, stand_img_path=str(profile))
+        with patch.object(stitch,'estimate_rigid',side_effect=AssertionError('rigid rerun')):
+            stitch.run_flexible(changed)
+            # Changing only rigid estimation settings must also allow flexible reuse.
+            stitch.run_flexible(replace(changed,rigid_roi_px=80,rigid_min_ncc=.7))
+            stitch.run_export(replace(changed,rigid_roi_px=80))
+            self.assertEqual(csv_path.read_bytes(),csv_before)
+            self.assertEqual(state_path.read_bytes(),state_before)
+            with self.assertRaisesRegex(RuntimeError,'source geometry'):
+                stitch.run_flexible(replace(changed,voxel_size=(2.,1.,1.)))
+            self.edit_rigid_csv(1,[3,-3,1])
+            with self.assertRaisesRegex(RuntimeError,'cache is incompatible'):
+                stitch.run_flexible(changed)
+
+    def test_rigid_checkpoint_rejects_changed_grouping_same_layer_count(self):
+        for z in ('3000', '3000.6', '3001.2'):
+            self.tile(f'X1000_Y2000_Z{z}', np.zeros((4, 8, 8), np.uint16))
+        old = self.config(stack_shape=(8, 8, 4), layer_z_tolerance_um=0)
+        current = replace(old, layer_z_tolerance_um=1)
+        old_idx, idx = stitch.load_index(old), stitch.load_index(current)
+        np.testing.assert_array_equal(old_idx.layer_starts, idx.layer_starts)
+        self.assertFalse(np.array_equal(old_idx.layer_ids, idx.layer_ids))
+        regdir = self.root / 'registration'
+        regdir.mkdir()
+        stitch.write_rigid_edit_checkpoint(old, old_idx, regdir,
+                                           stitch.config_signature(old, old_idx, 'rigid'), np.zeros((2, 3)))
+        with self.assertRaisesRegex(RuntimeError, 'source geometry'):
+            stitch.load_rigid_checkpoint(current, idx, regdir,
+                                         stitch.config_signature(current, idx, 'rigid'), reuse_completed=True)
 
     def test_standardization_profile_validation_and_disabled_mode(self):
         path = self.root/'illumination.tif'
