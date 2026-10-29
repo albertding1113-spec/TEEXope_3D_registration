@@ -13,7 +13,7 @@ c = Config(
     registration_preview_flexible_patches=5,
     # Acquisition folders: X..._Y..._Z.../0/ch00.ome.tif
     dir_path="/HWFS/zhaohu_lab/dingjiayi/data/260928_ER-mBaoJin_mito-mScarlet3H",
-    export_path="",
+    export_path="/HWFS/zhaohu_lab/dingjiayi/data/260928_ER-mBaoJin_mito-mScarlet3H/261029_X18000-51000_Y9000-41000_Z1500-5000",
     # Shared registration cache, independent of export_path.
     registration_dir="/HWFS/zhaohu_lab/dingjiayi/data/260928_ER-mBaoJin_mito-mScarlet3H/261028_registration_xyz_flexible",
     ch_num=2,
@@ -56,12 +56,13 @@ c = Config(
     # Applied before rigid/flexible registration and signal export; labels are unchanged.
     if_standardization=True,
     stand_img_path="/HWFS/zhaohu_lab/dingjiayi/data/standardization_image.tif",  # e.g. "/path/to/average_illumination.tif"
-    if_downsample=True,
-    downsample_factor=(10, 10, 100),
-    if_subregion=False,
-    subregion_range=((41500, 44500), (23000, 26000), (3100, 3300)),
+    if_downsample=False,
+    downsample_factor=(10, 10, 500),
+    if_subregion=True,
+    subregion_range=((18000, 51000), (9000, 41000), (1500, 5000)),
     compression="lzw",   # use None if imagecodecs is unavailable
     tiff_tile=256,
+    export_workers=1,  # sbatch overrides this; cache_mb is per worker
     tiff_maxworkers=2,
     cache_mb=512,
     cache_open_files=64,
@@ -80,7 +81,15 @@ if __name__ == "__main__":
     parser.add_argument('--stage', choices=('rigid','flexible','export','preview','all'), default=c.workflow_stage)
     parser.add_argument('--force-registration', action='store_true', default=None,
                         help='Recompute only the selected registration stage; rigid overwrites edited CSV (backup saved)')
+    parser.add_argument('--export-workers', type=int, default=c.export_workers,
+                        help='Independent slice processes (export stage only)')
+    parser.add_argument('--tiff-maxworkers', type=int, default=c.tiff_maxworkers,
+                        help='TIFF compression threads per slice process')
+    parser.add_argument('--export-path', default=c.export_path,
+                        help='Destination for output slices and export metadata')
     args = parser.parse_args()
     run(replace(c,workflow_stage=args.stage,
+                export_workers=args.export_workers, tiff_maxworkers=args.tiff_maxworkers,
+                export_path=args.export_path,
                 force_registration=c.force_registration if args.force_registration is None
                 else args.force_registration))

@@ -14,6 +14,9 @@ All geometry stages accumulate those corrections internally; automatic limits ar
 from __future__ import annotations
 
 import csv
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from multiprocessing.util import Finalize
 import hashlib
 import json
 import math
@@ -123,6 +126,7 @@ class Config:
 
     compression: Optional[str] = "lzw"  # None or 'lzw' (requires imagecodecs)
     tiff_tile: int = 256  # TIFF block side; a multiple of 16
+    export_workers: int = 1  # independent slice processes; cache_mb is PER process
     tiff_maxworkers: int = 2  # concurrent TIFF tile compression workers
     opencv_threads: int = 1  # avoid nested thread pools on Slurm nodes
     cache_mb: int = 512  # decompressed (and XY downsampled) source page LRU cache
@@ -1692,6 +1696,124 @@ def save_checkpoint_overlap_previews(c: Config, idx: Index, regdir: Path,
     progress("Rigid checkpoint overlap review saved: %s",root)
 
 
+def export_slice(c, index, fields, cache, standard_factor, export_xy_min,
+                 export_xy_max, field_margin_raw, width, height, z0, z1, z, ch):
+    """Stream one independent slice; publish only after its TIFF is complete."""
+    outdir = Path(c.export_path)
+    dx, dy, dz = c.downsample_factor if c.if_downsample else (1, 1, 1)
+    channels = c.ch_num + len(c.segmented_ch)
+    target_count = math.ceil((z1-z0)/dz) * channels
+    target = outdir / f"ch{ch:02d}_z{z:06d}.tif"
+    image_number = ((z-z0)//dz)*channels + ch + 1
+    dtype = (np.uint32 if ch >= c.ch_num and c.segmentation_mode == "preserve_labels"
+             else np.uint16)
+    image_started = time.perf_counter()
+    progress("Export image %d/%d: %s, raw Z=%d, channel=%d, YX=%dx%d, dtype=%s",
+             image_number,target_count,target,z,ch,height,width,np.dtype(dtype))
+    if c.resume and target.is_file():
+        try:
+            with tifffile.TiffFile(target) as existing:
+                page = existing.pages[0]
+                size = target.stat().st_size
+                valid = (len(existing.pages) == 1 and page.shape == (height, width)
+                         and page.dtype == np.dtype(dtype) and page.is_tiled
+                         and all(n > 0 and offset > 0 and offset + n <= size
+                                 for offset, n in zip(page.dataoffsets, page.databytecounts)))
+            if valid:
+                progress("Skip validated %s", target.name)
+                return
+        except (OSError, ValueError, IndexError):
+            pass
+        progress("WARNING: Rebuilding incomplete/invalid output %s", target.name)
+    tmp = Path(str(target) + ".partial")
+    if tmp.exists():
+        tmp.unlink()
+    dtype = (np.uint32 if ch >= c.ch_num and c.segmentation_mode == "preserve_labels"
+             else np.uint16)
+    def image_tiles():
+        rows = math.ceil(height/c.tiff_tile)
+        for oy in range(0, height, c.tiff_tile):
+            row = oy//c.tiff_tile + 1
+            if row == 1 or row % max(1,math.ceil(rows/10)) == 0 or row == rows:
+                progress("Export image %d/%d %s: rendering tile row %d/%d, elapsed=%.1fs",
+                         image_number,target_count,target.name,row,rows,time.perf_counter()-image_started)
+            for ox in range(0, width, c.tiff_tile):
+                yield render_output_tile(c, index, fields, cache, z, ch, oy, ox,
+                                         height, width, standard_factor, export_xy_min,
+                                         field_margin_raw, export_xy_max)
+    # Tiled BigTIFF generator: no full-size Z-plane is constructed in RAM.
+    with tifffile.TiffWriter(tmp, bigtiff=True) as writer:
+        writer.write(image_tiles(), shape=(height, width), dtype=dtype,
+                     tile=(c.tiff_tile, c.tiff_tile), photometric="minisblack",
+                     compression=c.compression, metadata=None,
+                     resolution=(10000/(c.voxel_size[0]*dx), 10000/(c.voxel_size[1]*dy)),
+                     resolutionunit="CENTIMETER",
+                     maxworkers=c.tiff_maxworkers)
+    os.replace(tmp, target)  # atomic on one filesystem; safe resume
+    progress("Export image %d/%d saved: %s, size=%.2f MiB, elapsed=%.1fs",
+             image_number,target_count,target,target.stat().st_size/1024**2,
+             time.perf_counter()-image_started)
+
+
+_EXPORT_STATE = None
+_EXPORT_CACHE = None
+
+
+def init_export_worker(c, *state):
+    # Spawn avoids inheriting native thread pools or open TIFF file handles.
+    global _EXPORT_STATE, _EXPORT_CACHE
+    cv2.setNumThreads(c.opencv_threads)
+    _EXPORT_STATE = (c, *state)
+    _EXPORT_CACHE = PageCache(c.cache_mb, c.cache_open_files, c.strict_input, c.stack_shape)
+    Finalize(_EXPORT_CACHE, _EXPORT_CACHE.close, exitpriority=10)
+
+
+def export_worker(task):
+    c, index, fields, *geometry = _EXPORT_STATE
+    export_slice(c, index, fields, _EXPORT_CACHE, *geometry, *task)
+
+
+def export_slices(c, index, fields, standard_factor, export_xy_min, export_xy_max,
+                  field_margin_raw, width, height, z0, z1):
+    dz = c.downsample_factor[2] if c.if_downsample else 1
+    channels = c.ch_num + len(c.segmented_ch)
+    total = math.ceil((z1-z0)/dz) * channels
+    workers = min(c.export_workers, total)
+    state = (c, index, fields, standard_factor, export_xy_min, export_xy_max,
+             field_margin_raw, width, height, z0, z1)
+    tasks = ((z, ch) for z in range(z0, z1, dz) for ch in range(channels))
+    progress("Export %d TIFFs, each %dx%d pixels; %d slice processes, %d TIFF threads/process; "
+             "page cache up to %d MiB total (additional working memory required)",
+             total, width, height, workers, c.tiff_maxworkers, workers*c.cache_mb)
+    if workers == 1:
+        with PageCache(c.cache_mb, c.cache_open_files, c.strict_input, c.stack_shape) as cache:
+            for z, ch in tasks:
+                export_slice(c, index, fields, cache, *state[3:], z, ch)
+    else:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context('spawn'),
+                                 initializer=init_export_worker, initargs=state) as pool:
+            # Bound queued work even for millions of slices, and propagate worker failures.
+            pending = set()
+            try:
+                for _ in range(workers * 2):
+                    task = next(tasks, None)
+                    if task is None:
+                        break
+                    pending.add(pool.submit(export_worker, task))
+                while pending:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        future.result()
+                    for _ in done:
+                        task = next(tasks, None)
+                        if task is not None:
+                            pending.add(pool.submit(export_worker, task))
+            finally:
+                for future in pending:
+                    future.cancel()
+    progress("Export complete: %s", c.export_path)
+
+
 def run_rigid(c: Config) -> None:
     run(replace(c,workflow_stage="rigid"))
 
@@ -1718,6 +1840,8 @@ def run(c: Config) -> None:
         raise NotImplementedError("Only Z subsampling is implemented; use 'sample'.")
     if c.segmentation_mode not in ("binary_255", "preserve_labels"):
         raise ValueError("segmentation_mode must be 'binary_255' or 'preserve_labels'")
+    if not isinstance(c.export_workers, int) or c.export_workers < 1:
+        raise ValueError("export_workers must be a positive integer")
     if c.tiff_maxworkers < 1:
         raise ValueError("tiff_maxworkers must be positive")
     if c.opencv_threads < 1:
@@ -1921,64 +2045,8 @@ def run(c: Config) -> None:
     meta_tmp=Path(str(metadata_path)+".partial")
     meta_tmp.write_text(json.dumps(meta,indent=2),encoding="utf-8")
     os.replace(meta_tmp,metadata_path)
-    with PageCache(c.cache_mb,c.cache_open_files,c.strict_input,c.stack_shape) as cache:
-        channels = c.ch_num + len(c.segmented_ch)
-        target_count = math.ceil((z1-z0)/dz) * channels
-        progress("Export %d TIFFs, each %dx%d pixels, %d channels", target_count, width, height, channels)
-        for z in range(z0, z1, dz):
-            for ch in range(channels):
-                target = outdir / f"ch{ch:02d}_z{z:06d}.tif"
-                image_number = ((z-z0)//dz)*channels + ch + 1
-                dtype = (np.uint32 if ch >= c.ch_num and c.segmentation_mode == "preserve_labels"
-                         else np.uint16)
-                image_started = time.perf_counter()
-                progress("Export image %d/%d: %s, raw Z=%d, channel=%d, YX=%dx%d, dtype=%s",
-                         image_number,target_count,target,z,ch,height,width,np.dtype(dtype))
-                if c.resume and target.is_file():
-                    try:
-                        with tifffile.TiffFile(target) as existing:
-                            page = existing.pages[0]
-                            size = target.stat().st_size
-                            valid = (len(existing.pages) == 1 and page.shape == (height, width)
-                                     and page.dtype == np.dtype(dtype) and page.is_tiled
-                                     and all(n > 0 and offset > 0 and offset + n <= size
-                                             for offset, n in zip(page.dataoffsets, page.databytecounts)))
-                        if valid:
-                            progress("Skip validated %s", target.name)
-                            continue
-                    except (OSError, ValueError, IndexError):
-                        pass
-                    progress("WARNING: Rebuilding incomplete/invalid output %s", target.name)
-                tmp = Path(str(target) + ".partial")
-                if tmp.exists():
-                    tmp.unlink()
-                dtype = (np.uint32 if ch >= c.ch_num and c.segmentation_mode == "preserve_labels"
-                         else np.uint16)
-                def image_tiles():
-                    rows = math.ceil(height/c.tiff_tile)
-                    for oy in range(0, height, c.tiff_tile):
-                        row = oy//c.tiff_tile + 1
-                        if row == 1 or row % max(1,math.ceil(rows/10)) == 0 or row == rows:
-                            progress("Export image %d/%d %s: rendering tile row %d/%d, elapsed=%.1fs",
-                                     image_number,target_count,target.name,row,rows,time.perf_counter()-image_started)
-                        for ox in range(0, width, c.tiff_tile):
-                            yield render_output_tile(c, index, fields, cache, z, ch, oy, ox,
-                                                     height, width, standard_factor, export_xy_min,
-                                                     field_margin_raw, export_xy_max)
-                # Tiled BigTIFF generator: no full-size Z-plane is constructed in RAM.
-                with tifffile.TiffWriter(tmp, bigtiff=True) as writer:
-                    writer.write(image_tiles(), shape=(height, width), dtype=dtype,
-                                 tile=(c.tiff_tile, c.tiff_tile), photometric="minisblack",
-                                 compression=c.compression, metadata=None,
-                                 resolution=(10000/(c.voxel_size[0]*dx), 10000/(c.voxel_size[1]*dy)),
-                                 resolutionunit="CENTIMETER",
-                                 maxworkers=c.tiff_maxworkers)
-                os.replace(tmp, target)  # atomic on one filesystem; safe resume
-                progress("Export image %d/%d saved: %s, size=%.2f MiB, elapsed=%.1fs",
-                         image_number,target_count,target,target.stat().st_size/1024**2,
-                         time.perf_counter()-image_started)
-        progress("Export complete: %s", outdir)
-        cache.close()
+    export_slices(c, index, fields, standard_factor, export_xy_min, export_xy_max,
+                  field_margin_raw, width, height, z0, z1)
 
 
 if __name__ == "__main__":

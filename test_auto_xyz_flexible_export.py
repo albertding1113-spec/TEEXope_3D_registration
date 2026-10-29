@@ -44,6 +44,52 @@ class StitchTests(unittest.TestCase):
         dest.mkdir(parents=True, exist_ok=True)
         tifffile.imwrite(dest / channel, data, photometric='minisblack')
 
+    def test_parallel_export_matches_serial_and_repairs_resume(self):
+        data = np.arange(4*35*37, dtype=np.uint16).reshape(4,35,37)
+        name = 'X1000_Y2000_Z3000'
+        self.tile(name, data)
+        self.tile(name, data+300, 'ch01.ome.tif')
+        labels = np.full(data.shape, 4000000001, np.uint32)
+        dest = self.root/'input'/name/'segmentation'/'instances'
+        dest.mkdir(parents=True)
+        tifffile.imwrite(dest/'instances.tif', labels, photometric='minisblack')
+        profile = self.root/'profile.tif'
+        tifffile.imwrite(profile, np.linspace(1,2,35*37,dtype=np.float32).reshape(35,37))
+        c = self.config(workflow_stage='export', stack_shape=(37,35,4), ch_num=2,
+                        rigid_stitch=False, segmented_ch=('instances',),
+                        segmentation_mode='preserve_labels', compression='lzw',
+                        if_standardization=True, stand_img_path=str(profile),
+                        if_downsample=True, downsample_factor=(2,3,1))
+        stitch.run(c)
+        parallel = replace(c, export_path=str(self.root/'parallel'), export_workers=2)
+        stitch.run(parallel)
+        outputs = sorted((self.root/'out').glob('*.tif'))
+        self.assertEqual(len(outputs), 12)
+        for path in outputs:
+            np.testing.assert_array_equal(tifffile.imread(path),
+                                          tifffile.imread(self.root/'parallel'/path.name))
+        self.assertEqual(json.loads((self.root/'out'/'export_metadata.json').read_text()),
+                         json.loads((self.root/'parallel'/'export_metadata.json').read_text()))
+        intact = self.root/'parallel'/outputs[0].name
+        mtime = intact.stat().st_mtime_ns
+        broken = self.root/'parallel'/outputs[-1].name
+        broken.write_bytes(broken.read_bytes()[:32])
+        # Worker counts and compression thread counts do not invalidate resume.
+        stitch.run(replace(parallel, export_workers=3, tiff_maxworkers=1))
+        self.assertEqual(intact.stat().st_mtime_ns, mtime)
+        np.testing.assert_array_equal(tifffile.imread(broken), tifffile.imread(outputs[-1]))
+        self.assertFalse(list((self.root/'parallel').glob('*.partial')))
+
+    def test_parallel_export_propagates_input_failure(self):
+        self.tile('X1000_Y2000_Z3000', np.ones((2,8,8), np.uint16))
+        c = self.config(workflow_stage='export', stack_shape=(8,8,2),
+                        rigid_stitch=False, ch_num=2, export_workers=2)
+        with self.assertRaisesRegex(OSError, 'Cannot read'):
+            stitch.run(c)  # The second channel is deliberately missing.
+        self.assertFalse((self.root/'out'/'ch01_z000000.tif').exists())
+        with self.assertRaisesRegex(ValueError, 'export_workers'):
+            stitch.run(replace(c, export_workers=0))
+
     def test_nearby_z_coordinates_share_layer_and_source_pages(self):
         # Same XY and slightly different folder Z: retain both source stacks.
         for z in ('05378.000', '05378.196', '05378.900', '05379.000', '05379.800'):

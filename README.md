@@ -286,6 +286,56 @@ The profile must have finite, nonnegative values and a positive mean. Zero or ex
 
 Standardization is shared by **rigid, flexible, preview and export** stages. Estimation signatures fingerprint the actual correction factors. Changing correction does not require recalculating completed rigid offsets for subsequent stages: keep the same `registration_dir` and run `python -u run_auto_xyz_export.py --stage flexible --force-registration` to recompute only flexible fields with the current profile, preserving rigid state and manual CSV edits. Then export using the same profile and a new export directory. Running the rigid stage itself remains strict about changed profiles/settings. Standardization reduces illumination-induced tile seams; it does not correct geometric tile misplacement or independently varying tile brightness.
 
+### Parallel slice export on Slurm
+
+`run_auto_xyz_export.sbatch` requests one node on `fat2`, one task, 32 CPUs,
+and 64 GiB of memory. It runs `--stage export`, reading completed registration
+checkpoints. `--stage flexible` only computes flexible registration; it does not
+write the exported slices. Complete registration first, using the same dataset,
+registration directory, and illumination settings.
+
+```bash
+mkdir -p /HWFS/zhaohu_lab/dingjiayi/task/output
+cd /HWFS/zhaohu_lab/dingjiayi/code/TEEXope_3D_registration
+sbatch run_auto_xyz_export.sbatch
+# Alternatively, request a smaller allocation:
+sbatch --cpus-per-task=16 run_auto_xyz_export.sbatch
+```
+
+Activate your existing Python environment in the sbatch script if needed. The
+script uses the RPL10a paths configured in the launcher and defaults to output
+directory `261028_export_xyz_flexible` under that dataset. Set `EXPORT_PATH` in
+the submission environment or pass `--export-path /path/to/output` after the
+sbatch filename to change it. Only run one export job per output directory.
+
+`--export-workers` controls independent processes, each streaming a different
+Z/channel TIFF. `--tiff-maxworkers` controls TIFF compression threads inside each
+process. The script budgets one rendering CPU plus `TIFF_THREADS` compression
+CPUs per process: with 32 CPUs and the default `TIFF_THREADS=2`, it starts 10
+slice processes. It limits BLAS/OpenMP and OpenCV to one thread to avoid nested
+thread pools consuming the allocation. This is single-node parallelism; adding
+Slurm tasks or nodes does not distribute the export.
+
+For a direct run with explicit resources:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+python -u run_auto_xyz_export.py --stage export \
+  --export-path /path/to/output --export-workers 10 --tiff-maxworkers 2
+```
+
+Each process owns its TIFF handles and page cache. With `cache_mb=512`, ten
+workers may use 5 GiB for page caches alone; copied geometry, displacement fields,
+illumination arrays, decoded source pages, and compression buffers require
+additional memory. Full output slices are still streamed in tiles, and pending
+work is bounded. Increase workers gradually: shared-filesystem bandwidth and
+metadata traffic can limit throughput. No cluster speedup has been benchmarked.
+
+Finished slices retain the existing validation and atomic rename behavior.
+Changing worker/thread counts does not invalidate resume or registration caches.
+Worker errors fail the job; rerunning rebuilds incomplete slices and skips valid
+ones. Registration itself remains sequential across layers.
+
 ### Synthetic tests
 
 ```bash
@@ -293,7 +343,8 @@ cd /path/to/package
 OPENBLAS_NUM_THREADS=1 python test_auto_xyz_flexible_export.py
 ```
 
-The 20 integration tests use real synthetic TIFF inputs. They cover XYZ recovery
+The integration tests use real synthetic TIFF inputs. They cover parallel/serial
+pixel equivalence, parallel resume repair and worker error propagation; XYZ recovery
 with Z refinement; pairwise rigid offsets with accumulated drift beyond the
 adjacent-layer limits; rejection of excessive XY/Z pair shifts; interrupted rigid
 and flexible resume; bounded patch processing; manual pair edits propagating
