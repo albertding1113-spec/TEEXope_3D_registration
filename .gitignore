@@ -1,0 +1,7 @@
+.venv-imaris/
+.pytest_cache/
+__pycache__/
+.venv-nd2/
+.nd2-test-tmp-*/
+nd2_*_stage.local.json
+nd2_smoke_output/

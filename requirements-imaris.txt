@@ -1,0 +1,9 @@
+# 64-bit Python 3.10-3.12. Native writer dependencies also required.
+# Older Python environments need the compatible codec/NumPy stack together.
+numpy==2.2.6; python_version < "3.12"
+tifffile==2025.5.10; python_version < "3.12"
+imagecodecs==2025.3.30; python_version < "3.12"
+numpy==2.5.4; python_version >= "3.12"
+tifffile==2026.10.15; python_version >= "3.12"
+imagecodecs==2026.10.10; python_version >= "3.12"
+PyImarisWriter==0.7.0
